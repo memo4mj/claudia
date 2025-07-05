@@ -1,0 +1,122 @@
+name: Release macOS Build
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers on version tags like v1.0.0
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+    - name: Rust cache
+      uses: swatinem/rust-cache@v2
+      with:
+        workspaces: './src-tauri -> target'
+
+    - name: Install Bun
+      uses: oven-sh/setup-bun@v1
+      with:
+        bun-version: latest
+
+    - name: Install frontend dependencies
+      run: bun install
+
+    - name: Build universal macOS app
+      run: bun run tauri build --target universal-apple-darwin
+      # env:
+        # TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+        # TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+    - name: Create DMG artifact
+      run: |
+        # Find the DMG file
+        DMG_PATH=$(find src-tauri/target/universal-apple-darwin/release/bundle/dmg -name "*.dmg" | head -1)
+        if [ -z "$DMG_PATH" ]; then
+          echo "No DMG found, checking for app bundle..."
+          APP_PATH=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -name "*.app" | head -1)
+          if [ -n "$APP_PATH" ]; then
+            # Create DMG from app bundle
+            hdiutil create -volname "Claudia" -srcfolder "$APP_PATH" -ov -format UDZO "Claudia-macOS.dmg"
+            echo "DMG_PATH=Claudia-macOS.dmg" >> $GITHUB_ENV
+          else
+            echo "No app bundle found either!"
+            exit 1
+          fi
+        else
+          # Copy DMG to predictable name
+          cp "$DMG_PATH" "Claudia-macOS.dmg"
+          echo "DMG_PATH=Claudia-macOS.dmg" >> $GITHUB_ENV
+        fi
+
+    - name: Upload DMG as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Claudia-macOS
+        path: Claudia-macOS.dmg
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          Claudia-macOS.dmg
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional: Build Intel and ARM separately if universal build fails
+  build-macos-separate:
+    runs-on: macos-latest
+    if: failure()  # Only run if universal build fails
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Rust cache
+      uses: swatinem/rust-cache@v2
+      with:
+        workspaces: './src-tauri -> target'
+
+    - name: Install Bun
+      uses: oven-sh/setup-bun@v1
+      with:
+        bun-version: latest
+
+    - name: Install frontend dependencies
+      run: bun install
+
+    - name: Build for ${{ matrix.target }}
+      run: bun run tauri build --target ${{ matrix.target }}
+      # env:
+        # TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+        # TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Claudia-${{ matrix.target }}
+        path: |
+          src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
