@@ -1,11 +1,16 @@
 [package]
 name = "claudia"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "GUI app and Toolkit for Claude Code"
+authors = ["mufeedvh", "123vviekr"]
+license = "AGPL-3.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "claudia"
+path = "src/main.rs"
 
 [lib]
 name = "claudia_lib"
@@ -38,7 +43,7 @@ regex = "1"
 glob = "0.3"
 base64 = "0.22"
 libc = "0.2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
 futures = "0.3"
 async-trait = "0.1"
 tempfile = "3"
@@ -47,6 +52,7 @@ sha2 = "0.10"
 zstd = "0.13"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 walkdir = "2"
+serde_yaml = "0.9"
 
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -56,3 +62,9 @@ objc = "0.2"
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

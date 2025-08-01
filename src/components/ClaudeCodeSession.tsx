@@ -8,10 +8,10 @@ import {
   ChevronDown,
   GitBranch,
   Settings,
-  Globe,
   ChevronUp,
   X,
-  Hash
+  Hash,
+  Command
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -26,12 +26,14 @@ import { FloatingPromptInput, type FloatingPromptInputRef } from "./FloatingProm
 import { ErrorBoundary } from "./ErrorBoundary";
 import { TimelineNavigator } from "./TimelineNavigator";
 import { CheckpointSettings } from "./CheckpointSettings";
+import { SlashCommandsManager } from "./SlashCommandsManager";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { SplitPane } from "@/components/ui/split-pane";
 import { WebviewPreview } from "./WebviewPreview";
 import type { ClaudeStreamMessage } from "./AgentExecution";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { useTrackEvent, useComponentMetrics, useWorkflowTracking } from "@/hooks";
 
 interface ClaudeCodeSessionProps {
   /**
@@ -46,6 +48,10 @@ interface ClaudeCodeSessionProps {
    * Callback to go back
    */
   onBack: () => void;
+  /**
+   * Callback to open hooks configuration
+   */
+  onProjectSettings?: (projectPath: string) => void;
   /**
    * Optional className for styling
    */
@@ -66,6 +72,7 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
   session,
   initialProjectPath = "",
   onBack,
+  onProjectSettings,
   className,
   onStreamingChange,
 }) => {
@@ -83,6 +90,7 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
   const [timelineVersion, setTimelineVersion] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [showForkDialog, setShowForkDialog] = useState(false);
+  const [showSlashCommandsSettings, setShowSlashCommandsSettings] = useState(false);
   const [forkCheckpointId, setForkCheckpointId] = useState<string | null>(null);
   const [forkSessionName, setForkSessionName] = useState("");
   
@@ -106,7 +114,32 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
   const queuedPromptsRef = useRef<Array<{ id: string; prompt: string; model: "sonnet" | "opus" }>>([]);
   const isMountedRef = useRef(true);
   const isListeningRef = useRef(false);
+  const sessionStartTime = useRef<number>(Date.now());
+  
+  // Session metrics state for enhanced analytics
+  const sessionMetrics = useRef({
+    firstMessageTime: null as number | null,
+    promptsSent: 0,
+    toolsExecuted: 0,
+    toolsFailed: 0,
+    filesCreated: 0,
+    filesModified: 0,
+    filesDeleted: 0,
+    codeBlocksGenerated: 0,
+    errorsEncountered: 0,
+    lastActivityTime: Date.now(),
+    toolExecutionTimes: [] as number[],
+    checkpointCount: 0,
+    wasResumed: !!session,
+    modelChanges: [] as Array<{ from: string; to: string; timestamp: number }>,
+  });
 
+  // Analytics tracking
+  const trackEvent = useTrackEvent();
+  useComponentMetrics('ClaudeCodeSession');
+  // const aiTracking = useAIInteractionTracking('sonnet'); // Default model
+  const workflowTracking = useWorkflowTracking('claude_session');
+  
   // Keep ref in sync with state
   useEffect(() => {
     queuedPromptsRef.current = queuedPrompts;
@@ -507,6 +540,74 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
             setRawJsonlOutput((prev) => [...prev, payload]);
 
             const message = JSON.parse(payload) as ClaudeStreamMessage;
+            
+            // Track enhanced tool execution
+            if (message.type === 'assistant' && message.message?.content) {
+              const toolUses = message.message.content.filter((c: any) => c.type === 'tool_use');
+              toolUses.forEach((toolUse: any) => {
+                // Increment tools executed counter
+                sessionMetrics.current.toolsExecuted += 1;
+                sessionMetrics.current.lastActivityTime = Date.now();
+                
+                // Track file operations
+                const toolName = toolUse.name?.toLowerCase() || '';
+                if (toolName.includes('create') || toolName.includes('write')) {
+                  sessionMetrics.current.filesCreated += 1;
+                } else if (toolName.includes('edit') || toolName.includes('multiedit') || toolName.includes('search_replace')) {
+                  sessionMetrics.current.filesModified += 1;
+                } else if (toolName.includes('delete')) {
+                  sessionMetrics.current.filesDeleted += 1;
+                }
+                
+                // Track tool start - we'll track completion when we get the result
+                workflowTracking.trackStep(toolUse.name);
+              });
+            }
+            
+            // Track tool results
+            if (message.type === 'user' && message.message?.content) {
+              const toolResults = message.message.content.filter((c: any) => c.type === 'tool_result');
+              toolResults.forEach((result: any) => {
+                const isError = result.is_error || false;
+                // Note: We don't have execution time here, but we can track success/failure
+                if (isError) {
+                  sessionMetrics.current.toolsFailed += 1;
+                  sessionMetrics.current.errorsEncountered += 1;
+                  
+                  trackEvent.enhancedError({
+                    error_type: 'tool_execution',
+                    error_code: 'tool_failed',
+                    error_message: result.content,
+                    context: `Tool execution failed`,
+                    user_action_before_error: 'executing_tool',
+                    recovery_attempted: false,
+                    recovery_successful: false,
+                    error_frequency: 1,
+                    stack_trace_hash: undefined
+                  });
+                }
+              });
+            }
+            
+            // Track code blocks generated
+            if (message.type === 'assistant' && message.message?.content) {
+              const codeBlocks = message.message.content.filter((c: any) => 
+                c.type === 'text' && c.text?.includes('```')
+              );
+              if (codeBlocks.length > 0) {
+                // Count code blocks in text content
+                codeBlocks.forEach((block: any) => {
+                  const matches = (block.text.match(/```/g) || []).length;
+                  sessionMetrics.current.codeBlocksGenerated += Math.floor(matches / 2);
+                });
+              }
+            }
+            
+            // Track errors in system messages
+            if (message.type === 'system' && (message.subtype === 'error' || message.error)) {
+              sessionMetrics.current.errorsEncountered += 1;
+            }
+            
             setMessages((prev) => [...prev, message]);
           } catch (err) {
             console.error('Failed to parse message:', err, payload);
@@ -518,6 +619,64 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
           setIsLoading(false);
           hasActiveSessionRef.current = false;
           isListeningRef.current = false; // Reset listening state
+          
+          // Track enhanced session stopped metrics when session completes
+          if (effectiveSession && claudeSessionId) {
+            const sessionStartTimeValue = messages.length > 0 ? messages[0].timestamp || Date.now() : Date.now();
+            const duration = Date.now() - sessionStartTimeValue;
+            const metrics = sessionMetrics.current;
+            const timeToFirstMessage = metrics.firstMessageTime 
+              ? metrics.firstMessageTime - sessionStartTime.current 
+              : undefined;
+            const idleTime = Date.now() - metrics.lastActivityTime;
+            const avgResponseTime = metrics.toolExecutionTimes.length > 0
+              ? metrics.toolExecutionTimes.reduce((a, b) => a + b, 0) / metrics.toolExecutionTimes.length
+              : undefined;
+            
+            trackEvent.enhancedSessionStopped({
+              // Basic metrics
+              duration_ms: duration,
+              messages_count: messages.length,
+              reason: success ? 'completed' : 'error',
+              
+              // Timing metrics
+              time_to_first_message_ms: timeToFirstMessage,
+              average_response_time_ms: avgResponseTime,
+              idle_time_ms: idleTime,
+              
+              // Interaction metrics
+              prompts_sent: metrics.promptsSent,
+              tools_executed: metrics.toolsExecuted,
+              tools_failed: metrics.toolsFailed,
+              files_created: metrics.filesCreated,
+              files_modified: metrics.filesModified,
+              files_deleted: metrics.filesDeleted,
+              
+              // Content metrics
+              total_tokens_used: totalTokens,
+              code_blocks_generated: metrics.codeBlocksGenerated,
+              errors_encountered: metrics.errorsEncountered,
+              
+              // Session context
+              model: metrics.modelChanges.length > 0 
+                ? metrics.modelChanges[metrics.modelChanges.length - 1].to 
+                : 'sonnet',
+              has_checkpoints: metrics.checkpointCount > 0,
+              checkpoint_count: metrics.checkpointCount,
+              was_resumed: metrics.wasResumed,
+              
+              // Agent context (if applicable)
+              agent_type: undefined, // TODO: Pass from agent execution
+              agent_name: undefined, // TODO: Pass from agent execution
+              agent_success: success,
+              
+              // Stop context
+              stop_source: 'completed',
+              final_state: success ? 'success' : 'failed',
+              has_pending_prompts: queuedPrompts.length > 0,
+              pending_prompts_count: queuedPrompts.length,
+            });
+          }
 
           if (effectiveSession && success) {
             try {
@@ -584,14 +743,58 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
           }
         };
         setMessages(prev => [...prev, userMessage]);
+        
+        // Update session metrics
+        sessionMetrics.current.promptsSent += 1;
+        sessionMetrics.current.lastActivityTime = Date.now();
+        if (!sessionMetrics.current.firstMessageTime) {
+          sessionMetrics.current.firstMessageTime = Date.now();
+        }
+        
+        // Track model changes
+        const lastModel = sessionMetrics.current.modelChanges.length > 0 
+          ? sessionMetrics.current.modelChanges[sessionMetrics.current.modelChanges.length - 1].to
+          : (sessionMetrics.current.wasResumed ? 'sonnet' : model); // Default to sonnet if resumed
+        
+        if (lastModel !== model) {
+          sessionMetrics.current.modelChanges.push({
+            from: lastModel,
+            to: model,
+            timestamp: Date.now()
+          });
+        }
+        
+        // Track enhanced prompt submission
+        const codeBlockMatches = prompt.match(/```[\s\S]*?```/g) || [];
+        const hasCode = codeBlockMatches.length > 0;
+        const conversationDepth = messages.filter(m => m.user_message).length;
+        const sessionAge = sessionStartTime.current ? Date.now() - sessionStartTime.current : 0;
+        const wordCount = prompt.split(/\s+/).filter(word => word.length > 0).length;
+        
+        trackEvent.enhancedPromptSubmitted({
+          prompt_length: prompt.length,
+          model: model,
+          has_attachments: false, // TODO: Add attachment support when implemented
+          source: 'keyboard', // TODO: Track actual source (keyboard vs button)
+          word_count: wordCount,
+          conversation_depth: conversationDepth,
+          prompt_complexity: wordCount < 20 ? 'simple' : wordCount < 100 ? 'moderate' : 'complex',
+          contains_code: hasCode,
+          language_detected: hasCode ? codeBlockMatches?.[0]?.match(/```(\w+)/)?.[1] : undefined,
+          session_age_ms: sessionAge
+        });
 
         // Execute the appropriate command
         if (effectiveSession && !isFirstPrompt) {
           console.log('[ClaudeCodeSession] Resuming session:', effectiveSession.id);
+          trackEvent.sessionResumed(effectiveSession.id);
+          trackEvent.modelSelected(model);
           await api.resumeClaudeCode(projectPath, effectiveSession.id, prompt, model);
         } else {
           console.log('[ClaudeCodeSession] Starting new session');
           setIsFirstPrompt(false);
+          trackEvent.sessionCreated(model, 'prompt_input');
+          trackEvent.modelSelected(model);
           await api.executeClaudeCode(projectPath, prompt, model);
         }
       }
@@ -687,12 +890,75 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
     // Ensure timeline reloads to highlight current checkpoint
     setTimelineVersion((v) => v + 1);
   };
+  
+  const handleCheckpointCreated = () => {
+    // Update checkpoint count in session metrics
+    sessionMetrics.current.checkpointCount += 1;
+  };
 
   const handleCancelExecution = async () => {
     if (!claudeSessionId || !isLoading) return;
     
     try {
+      const sessionStartTime = messages.length > 0 ? messages[0].timestamp || Date.now() : Date.now();
+      const duration = Date.now() - sessionStartTime;
+      
       await api.cancelClaudeExecution(claudeSessionId);
+      
+      // Calculate metrics for enhanced analytics
+      const metrics = sessionMetrics.current;
+      const timeToFirstMessage = metrics.firstMessageTime 
+        ? metrics.firstMessageTime - sessionStartTime.current 
+        : undefined;
+      const idleTime = Date.now() - metrics.lastActivityTime;
+      const avgResponseTime = metrics.toolExecutionTimes.length > 0
+        ? metrics.toolExecutionTimes.reduce((a, b) => a + b, 0) / metrics.toolExecutionTimes.length
+        : undefined;
+      
+      // Track enhanced session stopped
+      trackEvent.enhancedSessionStopped({
+        // Basic metrics
+        duration_ms: duration,
+        messages_count: messages.length,
+        reason: 'user_stopped',
+        
+        // Timing metrics
+        time_to_first_message_ms: timeToFirstMessage,
+        average_response_time_ms: avgResponseTime,
+        idle_time_ms: idleTime,
+        
+        // Interaction metrics
+        prompts_sent: metrics.promptsSent,
+        tools_executed: metrics.toolsExecuted,
+        tools_failed: metrics.toolsFailed,
+        files_created: metrics.filesCreated,
+        files_modified: metrics.filesModified,
+        files_deleted: metrics.filesDeleted,
+        
+        // Content metrics
+        total_tokens_used: totalTokens,
+        code_blocks_generated: metrics.codeBlocksGenerated,
+        errors_encountered: metrics.errorsEncountered,
+        
+        // Session context
+        model: metrics.modelChanges.length > 0 
+          ? metrics.modelChanges[metrics.modelChanges.length - 1].to 
+          : 'sonnet', // Default to sonnet
+        has_checkpoints: metrics.checkpointCount > 0,
+        checkpoint_count: metrics.checkpointCount,
+        was_resumed: metrics.wasResumed,
+        
+        // Agent context (if applicable)
+        agent_type: undefined, // TODO: Pass from agent execution
+        agent_name: undefined, // TODO: Pass from agent execution
+        agent_success: undefined, // TODO: Pass from agent execution
+        
+        // Stop context
+        stop_source: 'user_button',
+        final_state: 'cancelled',
+        has_pending_prompts: queuedPrompts.length > 0,
+        pending_prompts_count: queuedPrompts.length,
+      });
       
       // Clean up listeners
       unlistenRefs.current.forEach(unlisten => unlisten());
@@ -792,8 +1058,6 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
     // Keep the previewUrl so it can be restored when reopening
   };
 
-
-
   const handlePreviewUrlChange = (url: string) => {
     console.log('[ClaudeCodeSession] Preview URL changed to:', url);
     setPreviewUrl(url);
@@ -816,6 +1080,37 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       isMountedRef.current = false;
       isListeningRef.current = false;
       
+      // Track session completion with engagement metrics
+      if (effectiveSession) {
+        trackEvent.sessionCompleted();
+        
+        // Track session engagement
+        const sessionDuration = sessionStartTime.current ? Date.now() - sessionStartTime.current : 0;
+        const messageCount = messages.filter(m => m.user_message).length;
+        const toolsUsed = new Set<string>();
+        messages.forEach(msg => {
+          if (msg.type === 'assistant' && msg.message?.content) {
+            const tools = msg.message.content.filter((c: any) => c.type === 'tool_use');
+            tools.forEach((tool: any) => toolsUsed.add(tool.name));
+          }
+        });
+        
+        // Calculate engagement score (0-100)
+        const engagementScore = Math.min(100, 
+          (messageCount * 10) + 
+          (toolsUsed.size * 5) + 
+          (sessionDuration > 300000 ? 20 : sessionDuration / 15000) // 5+ min session gets 20 points
+        );
+        
+        trackEvent.sessionEngagement({
+          session_duration_ms: sessionDuration,
+          messages_sent: messageCount,
+          tools_used: Array.from(toolsUsed),
+          files_modified: 0, // TODO: Track file modifications
+          engagement_score: Math.round(engagementScore)
+        });
+      }
+      
       // Clean up listeners
       unlistenRefs.current.forEach(unlisten => unlisten());
       unlistenRefs.current = [];
@@ -827,7 +1122,7 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
         });
       }
     };
-  }, [effectiveSession]);
+  }, [effectiveSession, projectPath]);
 
   const messagesList = (
     <div
@@ -971,107 +1266,121 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
               <ArrowLeft className="h-4 w-4" />
             </Button>
             <div className="flex items-center gap-2">
-              <Terminal className="h-5 w-5" />
-              <div>
-                <h2 className="text-lg font-semibold">Claude Code Session</h2>
-                <p className="text-xs text-muted-foreground">
-                  {session ? `Resuming session ${session.id.slice(0, 8)}...` : 'Interactive session'}
+              <Terminal className="h-5 w-5 text-muted-foreground" />
+              <div className="flex-1">
+                <h1 className="text-xl font-bold">Claude Code Session</h1>
+                <p className="text-sm text-muted-foreground">
+                  {projectPath ? `${projectPath}` : "No project selected"}
                 </p>
               </div>
             </div>
           </div>
           
           <div className="flex items-center gap-2">
-            {effectiveSession && (
-              <>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowSettings(!showSettings)}
-                  className="flex items-center gap-2"
-                >
-                  <Settings className="h-4 w-4" />
-                  Settings
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowTimeline(!showTimeline)}
-                  className="flex items-center gap-2"
-                >
-                  <GitBranch className="h-4 w-4" />
-                  Timeline
-                </Button>
-              </>
+            {projectPath && onProjectSettings && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onProjectSettings(projectPath)}
+                disabled={isLoading}
+              >
+                <Settings className="h-4 w-4 mr-2" />
+                Hooks
+              </Button>
             )}
-            
-            {/* Preview Button */}
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      if (!showPreview) {
-                        // Open with current URL or empty URL to show the instruction state
-                        setShowPreview(true);
-                      } else {
-                        handleClosePreview();
-                      }
-                    }}
-                    className="flex items-center gap-2"
-                  >
-                    <Globe className="h-4 w-4" />
-                    {showPreview ? "Close Preview" : "Preview"}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {showPreview 
-                    ? "Close the preview pane" 
-                    : "Open a browser preview to test your web applications"
+            {projectPath && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowSlashCommandsSettings(true)}
+                disabled={isLoading}
+              >
+                <Command className="h-4 w-4 mr-2" />
+                Commands
+              </Button>
+            )}
+            <div className="flex items-center gap-2">
+              {showSettings && (
+                <CheckpointSettings
+                  sessionId={effectiveSession?.id || ''}
+                  projectId={effectiveSession?.project_id || ''}
+                  projectPath={projectPath}
+                />
+              )}
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setShowSettings(!showSettings)}
+                      className="h-8 w-8"
+                    >
+                      <Settings className={cn("h-4 w-4", showSettings && "text-primary")} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>Checkpoint Settings</p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              {effectiveSession && (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => setShowTimeline(!showTimeline)}
+                        className="h-8 w-8"
+                      >
+                        <GitBranch className={cn("h-4 w-4", showTimeline && "text-primary")} />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Timeline Navigator</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
+              {messages.length > 0 && (
+                <Popover
+                  trigger={
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="flex items-center gap-2"
+                    >
+                      <Copy className="h-4 w-4" />
+                      Copy Output
+                      <ChevronDown className="h-3 w-3" />
+                    </Button>
                   }
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-            
-            {messages.length > 0 && (
-              <Popover
-                trigger={
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="flex items-center gap-2"
-                  >
-                    <Copy className="h-4 w-4" />
-                    Copy Output
-                    <ChevronDown className="h-3 w-3" />
-                  </Button>
-                }
-                content={
-                  <div className="w-44 p-1">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={handleCopyAsMarkdown}
-                      className="w-full justify-start"
-                    >
-                      Copy as Markdown
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={handleCopyAsJsonl}
-                      className="w-full justify-start"
-                    >
-                      Copy as JSONL
-                    </Button>
-                  </div>
-                }
-                open={copyPopoverOpen}
-                onOpenChange={setCopyPopoverOpen}
-              />
-            )}
+                  content={
+                    <div className="w-44 p-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleCopyAsMarkdown}
+                        className="w-full justify-start"
+                      >
+                        Copy as Markdown
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleCopyAsJsonl}
+                        className="w-full justify-start"
+                      >
+                        Copy as JSONL
+                      </Button>
+                    </div>
+                  }
+                  open={copyPopoverOpen}
+                  onOpenChange={setCopyPopoverOpen}
+                />
+              )}
+            </div>
           </div>
         </motion.div>
 
@@ -1314,6 +1623,7 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
                     currentMessageIndex={messages.length - 1}
                     onCheckpointSelect={handleCheckpointSelect}
                     onFork={handleFork}
+                    onCheckpointCreated={handleCheckpointCreated}
                     refreshVersion={timelineVersion}
                   />
                 </div>
@@ -1378,6 +1688,23 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
               projectPath={projectPath}
               onClose={() => setShowSettings(false)}
             />
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* Slash Commands Settings Dialog */}
+      {showSlashCommandsSettings && (
+        <Dialog open={showSlashCommandsSettings} onOpenChange={setShowSlashCommandsSettings}>
+          <DialogContent className="max-w-4xl max-h-[80vh] overflow-hidden">
+            <DialogHeader>
+              <DialogTitle>Slash Commands</DialogTitle>
+              <DialogDescription>
+                Manage project-specific slash commands for {projectPath}
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex-1 overflow-y-auto">
+              <SlashCommandsManager projectPath={projectPath} />
+            </div>
           </DialogContent>
         </Dialog>
       )}
